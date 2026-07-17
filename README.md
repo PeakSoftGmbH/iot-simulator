@@ -3,7 +3,7 @@
 A standalone telemetry simulator for the **IoT Security Platform**. It pretends
 to be a set of industrial machines and **publishes telemetry over MQTT** to
 PeakSoft's exposed broker, so you can **test the live platform with real data
-flowing through it** — then watch the results in the [dashboard](https://github.com/PeakChainNetwork/iot-security-platform-demo).
+flowing through it** — then watch the results in the [dashboard](https://github.com/PeakSoftGmbH/iot-security-platform-demo).
 
 It only *publishes* data; it contains none of the platform's backend or
 detection logic.
