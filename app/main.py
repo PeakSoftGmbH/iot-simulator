@@ -149,11 +149,16 @@ def connect_mqtt(host: str, port: int, username: str = None, password: str = Non
     client.on_connect = on_connect
     client.on_disconnect = on_disconnect
 
-    try:
-        client.connect(host, port, keepalive=60)
-    except Exception as e:
-        logger.error("Impossible de se connecter a %s:%d — %s", host, port, e)
-        sys.exit(1)
+    connected = False
+    retry_delay = 2
+    while not connected:
+        try:
+            client.connect(host, port, keepalive=60)
+            connected = True
+        except Exception as e:
+            logger.warning("Connexion a %s:%d impossible (%s) — reessai dans %ds...", host, port, e, retry_delay)
+            time.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, 30)
 
     client.loop_start()
     return client
@@ -171,17 +176,21 @@ async def stream_device(
     logger.info("Streaming demarre : %s → %s [label=%s, attack=%s]", device_name, topic, label, attack_type or "none")
 
     while True:
-        season_id = random.randint(1, 4)
-        row = pool.sample(season_id, device_name, label, attack_type=attack_type)
+        try:
+            season_id = random.randint(1, 4)
+            row = pool.sample(season_id, device_name, label, attack_type=attack_type)
 
-        payload_json = json.dumps(row, default=str)
-        result = mqtt_client.publish(topic, payload_json, qos=1)
+            payload_json = json.dumps(row, default=str)
+            result = mqtt_client.publish(topic, payload_json, qos=1)
 
-        if result.rc != mqtt.MQTT_ERR_SUCCESS:
-            logger.warning("Echec publication %s (rc=%d)", topic, result.rc)
+            if result.rc != mqtt.MQTT_ERR_SUCCESS:
+                logger.warning("Echec publication %s (rc=%d)", topic, result.rc)
+        except Exception as err:
+            logger.error("Erreur durant streaming %s: %s", topic, err)
 
         delay = random.uniform(delay_min, delay_max)
         await asyncio.sleep(delay)
+
 
 
 class AttackRequest(BaseModel):
