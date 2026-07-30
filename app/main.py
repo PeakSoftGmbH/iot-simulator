@@ -1,440 +1,229 @@
-from __future__ import annotations
-
+"""
+TON_IoT Simulator with FastAPI Health Check
+===========================================
+Replaces the old synthetic data simulator.
+"""
 import asyncio
 import json
 import logging
 import os
 import random
-import uuid
-from dataclasses import asdict, dataclass
+import sys
+import time
 from datetime import datetime, timezone
-from typing import Any, Literal, Optional
+from pathlib import Path
+from typing import Optional
 
+import pandas as pd
 import paho.mqtt.client as mqtt
-import yaml
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import FastAPI
 
-from app.config import settings
-from app.machine import MachineModel, ProfileName, attacker_payload
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
+YEARLY_CSV = Path(os.getenv("YEARLY_CSV_PATH", "/app/Data/Generated/generated_yearly_merged.csv"))
+DEVICES = ["weather", "fridge", "thermostat"]
+SENSOR_COLUMNS = {
+    "weather":    "temperature",
+    "fridge":     "fridge_temperature",
+    "thermostat": "current_temperature",
+}
+ATTACK_TYPES = [
+    "backdoor", "DDoS", "DoS", "Injection",
+    "MITM", "password", "runsomware", "scanning", "XSS",
+]
+ATTACK_EXPLANATIONS = {
+    "backdoor":   "Backdoor détectée : communication sortante vers IP suspecte.",
+    "DDoS":       "DDoS détecté : rafale anormale de requêtes (> 50 msg/s).",
+    "DoS":        "DoS détecté : saturation du broker par paquets volumineux.",
+    "Injection":  "Injection de payload détectée : séquences d'échappement dans le message.",
+    "MITM":       "Man-in-the-Middle détecté : certificat TLS modifié.",
+    "password":   "Force brute détectée : > 10 échecs d'authentification en 1 min.",
+    "runsomware": "Ransomware détecté : valeurs aberrantes monotones dans les registres.",
+    "scanning":   "Scan réseau détecté : balayage de topics MQTT inexistants.",
+    "XSS":        "XSS détecté : balises HTML/JavaScript dans le payload.",
+}
 
-logger = logging.getLogger("iot-simulator")
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+def inject_anomaly(base_value: float, attack_type: str, noise: float = 0.0) -> float:
+    if base_value is None or pd.isna(base_value):
+        return base_value
+    if attack_type in ("DDoS", "DoS"):
+        return base_value * random.uniform(1.5, 3.0) + random.uniform(-2, 2)
+    elif attack_type == "backdoor":
+        return base_value + random.uniform(-0.5, 0.5)
+    elif attack_type == "Injection":
+        return base_value * random.uniform(0.1, 0.3) + random.uniform(5, 15)
+    elif attack_type == "MITM":
+        return base_value + random.uniform(-1.0, 1.0) + noise
+    elif attack_type == "runsomware":
+        return base_value + random.uniform(2.0, 5.0)
+    elif attack_type == "scanning":
+        return base_value * random.uniform(0.8, 1.2)
+    elif attack_type == "XSS":
+        return base_value + random.uniform(-0.3, 0.3)
+    elif attack_type == "password":
+        return base_value + random.uniform(-0.2, 0.2)
+    return base_value
 
-ScenarioName = Literal["none", "spike", "drift", "flood", "bad_payload", "impersonation"]
+class SeasonalPool:
+    def __init__(self, csv_path: Path):
+        logger.info("Chargement du dataset annuel : %s", csv_path)
+        self.df = pd.read_csv(csv_path)
+        self.df["timestamp"] = pd.to_datetime(self.df["timestamp"], errors="coerce")
+        self.df = self.df.dropna(subset=["timestamp"])
+        logger.info("  %d lignes chargées", len(self.df))
 
+        self._by_season = {}
+        for season_id in sorted(self.df["season"].unique()):
+            subset = self.df[self.df["season"] == season_id]
+            season_name = {1: "hiver", 2: "printemps", 3: "ete", 4: "automne"}.get(season_id, season_id)
+            logger.info("  Saison %d (%s) : %d lignes", season_id, season_name, len(subset))
+            self._by_season[season_id] = subset.reset_index(drop=True)
 
-@dataclass
-class ScenarioConfig:
-    scenario: ScenarioName = "none"
-    enabled: bool = False
-    params: dict[str, Any] | None = None
-
-
-class ScenarioRuleIn(BaseModel):
-    scenario: ScenarioName
-    enabled: bool = True
-    params: dict[str, Any] | None = None
-
-
-class ScenarioRequest(BaseModel):
-    global_: ScenarioRuleIn | None = Field(default=None, alias="global")
-    per_device: dict[str, ScenarioRuleIn] | None = None
-
-
-class SimulatorState:
-    def __init__(self) -> None:
-        self._lock = asyncio.Lock()
-        self.global_rule = ScenarioConfig()
-        self.per_device: dict[str, ScenarioConfig] = {}
-        self.last_metrics: dict[str, dict[str, Any]] = {}
-        self.device_profile: dict[str, ProfileName] = {}
-        self.started_at = datetime.now(timezone.utc).isoformat()
-
-        # Short-lived scenario counters (e.g., spike duration)
-        self._spike_remaining: dict[str, int] = {}
-
-    async def set_scenarios(self, req: ScenarioRequest) -> None:
-        async with self._lock:
-            if req.global_ is not None:
-                self.global_rule = ScenarioConfig(
-                    scenario=req.global_.scenario,
-                    enabled=req.global_.enabled,
-                    params=req.global_.params,
-                )
-            if req.per_device is not None:
-                for device_id, rule in req.per_device.items():
-                    self.per_device[device_id] = ScenarioConfig(
-                        scenario=rule.scenario,
-                        enabled=rule.enabled,
-                        params=rule.params,
-                    )
-
-    async def get_rule_for(self, device_id: str) -> ScenarioConfig:
-        async with self._lock:
-            specific = self.per_device.get(device_id)
-            if specific and specific.enabled:
-                return specific
-            if self.global_rule.enabled:
-                return self.global_rule
-            return ScenarioConfig()
-
-    async def set_last_metrics(self, device_id: str, metrics: dict[str, Any]) -> None:
-        async with self._lock:
-            self.last_metrics[device_id] = metrics
-
-    async def snapshot(self) -> dict[str, Any]:
-        async with self._lock:
-            return {
-                "started_at": self.started_at,
-                "global_rule": asdict(self.global_rule),
-                "per_device": {k: asdict(v) for k, v in self.per_device.items()},
-                "profiles": dict(self.device_profile),
-                "last_metrics": dict(self.last_metrics),
-            }
-
-    async def spike_remaining(self, device_id: str) -> int:
-        async with self._lock:
-            return self._spike_remaining.get(device_id, 0)
-
-    async def start_spike(self, device_id: str, n: int) -> None:
-        async with self._lock:
-            self._spike_remaining[device_id] = max(0, int(n))
-
-    async def dec_spike(self, device_id: str) -> None:
-        async with self._lock:
-            if device_id in self._spike_remaining:
-                self._spike_remaining[device_id] -= 1
-                if self._spike_remaining[device_id] <= 0:
-                    self._spike_remaining.pop(device_id, None)
-
-
-class MqttPublisher:
-    def __init__(
-        self,
-        host: str,
-        port: int,
-        username: str | None = None,
-        password: str | None = None,
-        transport: str = "tcp",
-        ws_path: str = "/mqtt",
-        tls: bool = False,
-        client_id: str | None = None,
-    ) -> None:
-        self.host = host
-        self.port = port
-        cid = client_id or f"iot-sim-{uuid.uuid4().hex[:8]}"
-        self.client = mqtt.Client(client_id=cid, transport="websockets" if transport == "websockets" else "tcp")
-        self._connected = asyncio.Event()
-        self._stopping = False
-
-        if transport == "websockets":
-            self.client.ws_set_options(path=ws_path)
-        if tls:
-            self.client.tls_set()
-
-        if username:
-            self.client.username_pw_set(username=username, password=password)
-
-        self.client.on_connect = self._on_connect
-        self.client.on_disconnect = self._on_disconnect
-
-    def _on_connect(self, client: mqtt.Client, userdata: Any, flags: dict[str, Any], rc: int) -> None:
-        if rc == 0:
-            logger.info("Connected to MQTT broker %s:%s", self.host, self.port)
-            self._connected.set()
+    def get_season(self, simulated_date: datetime) -> int:
+        month = simulated_date.month
+        if month in (12, 1, 2):
+            return 1
+        elif month in (3, 4, 5):
+            return 2
+        elif month in (6, 7, 8):
+            return 3
         else:
-            logger.warning("MQTT connect failed rc=%s", rc)
-            self._connected.clear()
+            return 4
 
-    def _on_disconnect(self, client: mqtt.Client, userdata: Any, rc: int) -> None:
-        self._connected.clear()
-        if self._stopping:
-            return
-        logger.warning("Disconnected from MQTT broker rc=%s", rc)
+    def sample(self, season_id: int, device: str, label: str, attack_type: str = "") -> dict:
+        pool = self._by_season.get(season_id, self.df)
+        if len(pool) == 0:
+            pool = self.df
+        row = pool.sample(n=1).iloc[0]
 
-    async def start(self) -> None:
-        # Start Paho network loop in its own thread.
-        await asyncio.to_thread(self.client.connect, self.host, self.port, 60)
-        self.client.loop_start()
-        asyncio.create_task(self._reconnect_loop())
+        base_device = device.replace("_attack", "")
+        sensor_col = SENSOR_COLUMNS[base_device]
+        base_temp = row[sensor_col]
 
-    async def stop(self) -> None:
-        self._stopping = True
-        self._connected.clear()
-        try:
-            await asyncio.to_thread(self.client.disconnect)
-        finally:
-            self.client.loop_stop()
+        if label == "attack":
+            sensor_value = inject_anomaly(base_temp, attack_type)
+        else:
+            sensor_value = float(base_temp) + random.uniform(-0.3, 0.3)
 
-    async def _reconnect_loop(self) -> None:
-        backoff = 0.5
-        while not self._stopping:
-            if self._connected.is_set():
-                backoff = 0.5
-                await asyncio.sleep(1.0)
-                continue
-            try:
-                await asyncio.to_thread(self.client.reconnect)
-                await asyncio.sleep(0.2)
-            except Exception as exc:
-                logger.warning("Reconnect attempt failed: %s", exc)
-                await asyncio.sleep(backoff)
-                backoff = min(15.0, backoff * 1.7)
+        payload = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "device_type": device,
+            sensor_col: round(sensor_value, 2),
+            "temperature": float(row["temperature"]),
+            "fridge_temperature": float(row["fridge_temperature"]),
+            "current_temperature": float(row["current_temperature"]),
+            "season": int(row["season"]),
+            "month": int(row["month"]),
+            "day": int(row["day"]),
+            "hour": int(row["hour"]),
+            "day_type": row["day_type"],
+            "label": label,
+            "attack_type": attack_type,
+            "attack_explanation": ATTACK_EXPLANATIONS.get(attack_type, ""),
+            "noise_factor": round(random.uniform(0.0, 0.06), 4),
+            "packet_loss_sim": random.choices([0, 1], weights=[95, 5])[0],
+        }
+        return payload
 
-    async def wait_connected(self, timeout_s: float = 10.0) -> bool:
-        try:
-            await asyncio.wait_for(self._connected.wait(), timeout=timeout_s)
-            return True
-        except asyncio.TimeoutError:
-            return False
+def connect_mqtt(host: str, port: int, username: str = None, password: str = None) -> mqtt.Client:
+    client = mqtt.Client(client_id="ton-iot-simulator-annual")
 
-    async def publish(self, topic: str, payload: str, qos: int = 1) -> None:
-        # Paho publish is thread-safe; still guard against disconnected state.
-        if not self._connected.is_set():
-            return
-        await asyncio.to_thread(self.client.publish, topic, payload, qos)
+    if username and password:
+        client.username_pw_set(username, password)
 
+    def on_connect(c, userdata, flags, rc):
+        if rc == 0:
+            logger.info("Connecte au broker MQTT %s:%d", host, port)
+        else:
+            logger.error("Connexion MQTT echouee (rc=%d)", rc)
 
-def load_profiles() -> dict[str, Any]:
-    cfg_path = os.path.join(os.path.dirname(__file__), "..", "config", "profiles.yaml")
-    cfg_path = os.path.abspath(cfg_path)
-    with open(cfg_path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)["profiles"]
+    def on_disconnect(c, userdata, rc):
+        logger.warning("Deconnecte du broker MQTT (rc=%d)", rc)
 
+    client.on_connect = on_connect
+    client.on_disconnect = on_disconnect
 
-def choose_initial_profile(device_id: str) -> ProfileName:
-    # Deterministic-ish distribution: dev-001 normal, dev-002 noisy, dev-003 failing by default
-    if device_id.endswith("001"):
-        return "normal"
-    if device_id.endswith("002"):
-        return "noisy"
-    if device_id.endswith("003"):
-        return "failing"
-    return random.choice(["normal", "noisy"])
+    try:
+        client.connect(host, port, keepalive=60)
+    except Exception as e:
+        logger.error("Impossible de se connecter a %s:%d — %s", host, port, e)
+        sys.exit(1)
 
+    client.loop_start()
+    return client
 
-def build_topic(device_id: str) -> str:
-    return f"factory/{device_id}/telemetry"
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-async def device_loop(
-    *,
-    device_id: str,
-    model: MachineModel,
-    state: SimulatorState,
-    publisher: MqttPublisher,
-    default_rate_hz: float,
+async def stream_device(
+    mqtt_client: mqtt.Client,
+    pool: SeasonalPool,
+    device_name: str,
+    label: str,
+    delay_min: float,
+    delay_max: float,
+    attack_type: str = "",
 ) -> None:
-    dt = max(0.01, 1.0 / float(default_rate_hz))
-    last_t = asyncio.get_event_loop().time()
-    sent = 0
+    topic = f"factory/{device_name}/telemetry"
+    logger.info("Streaming demarre : %s → %s [label=%s, attack=%s]", device_name, topic, label, attack_type or "none")
 
     while True:
-        rule = await state.get_rule_for(device_id)
+        season_id = random.randint(1, 4)
+        row = pool.sample(season_id, device_name, label, attack_type=attack_type)
 
-        # Flood changes publish cadence to 100Hz.
-        rate_hz = default_rate_hz
-        if rule.enabled and rule.scenario == "flood":
-            rate_hz = 100.0
-        dt_target = max(0.01, 1.0 / float(rate_hz))
+        payload_json = json.dumps(row, default=str)
+        result = mqtt_client.publish(topic, payload_json, qos=1)
 
-        # Compute dt based on real time to keep dynamics stable even if loop jitters.
-        now_t = asyncio.get_event_loop().time()
-        dt_sim = max(0.01, min(1.0, now_t - last_t))
-        last_t = now_t
+        if result.rc != mqtt.MQTT_ERR_SUCCESS:
+            logger.warning("Echec publication %s (rc=%d)", topic, result.rc)
 
-        # Scenario application
-        if model.state.profile == "attacker":
-            metrics: dict[str, Any] = attacker_payload(device_id)
-        else:
-            if rule.enabled and rule.scenario == "drift":
-                params = rule.params or {}
-                # drift rates are per-minute; apply proportionally to dt_sim
-                temp_per_min = float(params.get("temp_c_per_min", 0.25))
-                vib_per_min = float(params.get("vib_mms_per_min", 0.05))
-                press_per_min = float(params.get("pressure_psi_per_min", -0.2))
-                model.apply_drift(
-                    temp_c=temp_per_min * (dt_sim / 60.0),
-                    vib_mms=vib_per_min * (dt_sim / 60.0),
-                    pressure_psi=press_per_min * (dt_sim / 60.0),
-                )
-
-            if rule.enabled and rule.scenario == "spike":
-                remaining = await state.spike_remaining(device_id)
-                if remaining <= 0:
-                    params = rule.params or {}
-                    n = int(params.get("duration_messages", random.randint(5, 10)))
-                    await state.start_spike(device_id, n)
-                # while spike remaining, apply larger impulses
-                model.apply_spike(
-                    temp_c=float((rule.params or {}).get("temp_c", 18.0)),
-                    vib_mms=float((rule.params or {}).get("vib_mms", 2.2)),
-                )
-                await state.dec_spike(device_id)
-
-            s = model.step(dt_sim)
-            metrics = s.as_metrics()
-
-        await state.set_last_metrics(device_id, metrics)
-
-        # bad_payload scenario mutates the payload after metrics are computed
-        topic_device_id = device_id
-        payload: str
-        if rule.enabled and rule.scenario == "impersonation":
-            # Publish as unauthorized periodically (every ~10 messages)
-            if random.random() < float((rule.params or {}).get("prob", 0.12)):
-                topic_device_id = "unauthorized-id"
-
-        if rule.enabled and rule.scenario == "bad_payload":
-            mode = str((rule.params or {}).get("mode", random.choice(["corrupt_json", "missing_keys", "oversized"])))
-            if mode == "missing_keys":
-                payload_obj = {"timestamp": _now_iso(), "temperature": metrics.get("temperature")}
-                payload = json.dumps(payload_obj)
-            elif mode == "oversized":
-                big = "X" * int((rule.params or {}).get("bytes", 200_000))
-                payload_obj = {"timestamp": _now_iso(), "note": big, "temperature": metrics.get("temperature"), "pressure": metrics.get("pressure")}
-                payload = json.dumps(payload_obj)
-            else:
-                # corrupt_json
-                payload = '{"timestamp": "' + _now_iso() + '", "temperature": '  # intentionally truncated
-        else:
-            payload = json.dumps(metrics)
-
-        await publisher.publish(build_topic(topic_device_id), payload, qos=1)
-        sent += 1
-        if sent == 1 or sent % 10 == 0:
-            logger.info("Published %d msg(s) to %s", sent, build_topic(device_id))
-        await asyncio.sleep(dt_target)
+        delay = random.uniform(delay_min, delay_max)
+        await asyncio.sleep(delay)
 
 
-def create_app(state: SimulatorState) -> FastAPI:
-    app = FastAPI(title="iot-simulator", version="0.1.0")
+# FastAPI Application Setup
+app = FastAPI(title="iot-simulator-ton-iot", version="2.0.0")
 
-    @app.get("/health")
-    async def health() -> dict[str, str]:
-        return {"status": "ok"}
+# Global reference to prevent GC on tasks
+bg_tasks = []
 
-    @app.post("/scenario")
-    async def set_scenario(req: ScenarioRequest) -> dict[str, Any]:
-        if req.global_ is None and req.per_device is None:
-            raise HTTPException(status_code=400, detail="Provide at least one of: global, per_device")
-        await state.set_scenarios(req)
-        return {"ok": True}
-
-    @app.get("/state")
-    async def get_state() -> dict[str, Any]:
-        return await state.snapshot()
-
-    return app
-
-
-async def main_async() -> None:
-    profiles = load_profiles()
-    device_ids = settings.devices()
-
-    state = SimulatorState()
-    publisher = MqttPublisher(
-        settings.MQTT_HOST,
-        settings.MQTT_PORT,
-        settings.MQTT_USERNAME,
-        settings.MQTT_PASSWORD,
-        transport=settings.MQTT_TRANSPORT,
-        ws_path=settings.MQTT_WS_PATH,
-        tls=settings.MQTT_TLS,
-        client_id=settings.MQTT_CLIENT_ID or None,
-    )
-
-    # Create models
-    models: dict[str, MachineModel] = {}
-    for dev in device_ids:
-        profile: ProfileName = choose_initial_profile(dev)
-        state.device_profile[dev] = profile
-        models[dev] = MachineModel(dev, profile, profiles[profile if profile != "attacker" else "normal"])
-
-    await publisher.start()
-    await publisher.wait_connected(timeout_s=10.0)
-
-    # Start device tasks
-    tasks = [
-        asyncio.create_task(
-            device_loop(
-                device_id=dev,
-                model=models[dev],
-                state=state,
-                publisher=publisher,
-                default_rate_hz=settings.SIM_DEFAULT_RATE_HZ,
-            )
-        )
-        for dev in device_ids
-    ]
-
-    # Run until cancelled; FastAPI lifecycle will host this in uvicorn.
-    try:
-        await asyncio.gather(*tasks)
-    finally:
-        await publisher.stop()
-
-
-# FastAPI entrypoint: we start background tasks on startup.
-state = SimulatorState()
-app = create_app(state)
-
+@app.get("/health")
+async def health():
+    return {"status": "ok", "mode": "ton-iot-multivariate"}
 
 @app.on_event("startup")
-async def _startup() -> None:
-    profiles = load_profiles()
-    device_ids = settings.devices()
-
-    app.state.profiles = profiles
-    app.state.publisher = MqttPublisher(
-        settings.MQTT_HOST,
-        settings.MQTT_PORT,
-        settings.MQTT_USERNAME,
-        settings.MQTT_PASSWORD,
-        transport=settings.MQTT_TRANSPORT,
-        ws_path=settings.MQTT_WS_PATH,
-        tls=settings.MQTT_TLS,
-        client_id=settings.MQTT_CLIENT_ID or None,
-    )
-    app.state.models = {}
-
-    for dev in device_ids:
-        profile: ProfileName = choose_initial_profile(dev)
-        state.device_profile[dev] = profile
-        app.state.models[dev] = MachineModel(dev, profile, profiles[profile if profile != "attacker" else "normal"])
-
-    await app.state.publisher.start()
-    await app.state.publisher.wait_connected(timeout_s=10.0)
-
-    app.state.tasks = [
-        asyncio.create_task(
-            device_loop(
-                device_id=dev,
-                model=app.state.models[dev],
-                state=state,
-                publisher=app.state.publisher,
-                default_rate_hz=settings.SIM_DEFAULT_RATE_HZ,
+async def start_simulation():
+    host = os.getenv("MQTT_HOST", "mosquitto")
+    port = int(os.getenv("MQTT_PORT", "1883"))
+    username = os.getenv("MQTT_USERNAME", "iot_client")
+    password = os.getenv("MQTT_PASSWORD", "iot_password")
+    
+    # We will run continuously with default delay_min=0.3, delay_max=1.5
+    client = connect_mqtt(host, port, username, password)
+    
+    # Ensure CSV path exists
+    if not YEARLY_CSV.exists():
+        logger.error(f"Cannot find dataset at {YEARLY_CSV}! Simulation will not start.")
+        return
+        
+    pool = SeasonalPool(YEARLY_CSV)
+    
+    # Normal devices
+    for device_name in DEVICES:
+        bg_tasks.append(
+            asyncio.create_task(
+                stream_device(client, pool, device_name, "normal", 0.5, 2.0)
             )
         )
-        for dev in device_ids
-    ]
-
-
-@app.on_event("shutdown")
-async def _shutdown() -> None:
-    tasks = getattr(app.state, "tasks", [])
-    for t in tasks:
-        t.cancel()
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-    publisher: Optional[MqttPublisher] = getattr(app.state, "publisher", None)
-    if publisher is not None:
-        await publisher.stop()
-
+        
+    # Attack devices
+    for device_name in DEVICES:
+        attack_type = random.choice(ATTACK_TYPES)
+        bg_tasks.append(
+            asyncio.create_task(
+                stream_device(client, pool, f"{device_name}_attack", "attack", 0.5, 2.0, attack_type=attack_type)
+            )
+        )
+    logger.info("Simulation tasks successfully launched.")
