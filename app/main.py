@@ -17,6 +17,7 @@ from typing import Optional
 import pandas as pd
 import paho.mqtt.client as mqtt
 from fastapi import FastAPI
+from pydantic import BaseModel
 
 logging.basicConfig(
     level=logging.INFO,
@@ -183,47 +184,85 @@ async def stream_device(
         await asyncio.sleep(delay)
 
 
+class AttackRequest(BaseModel):
+    device: str  # one of: fridge, weather, thermostat
+    attack_type: str  # one of the ATTACK_TYPES
+
+
 # FastAPI Application Setup
 app = FastAPI(title="iot-simulator-ton-iot", version="2.0.0")
 
-# Global reference to prevent GC on tasks
+# Module-level MQTT client and pool references (set during startup)
+_mqtt_client: Optional[mqtt.Client] = None
+_pool: Optional[SeasonalPool] = None
+
+# Background tasks reference to prevent GC
 bg_tasks = []
+
 
 @app.get("/health")
 async def health():
     return {"status": "ok", "mode": "ton-iot-multivariate"}
 
+
+@app.post("/attack")
+async def trigger_attack(req: AttackRequest):
+    """Publish a single on-demand attack event via MQTT."""
+    if _mqtt_client is None or _pool is None:
+        return {"status": "error", "reason": "Simulator not ready"}
+
+    base_device = req.device.replace("_attack", "")
+    if base_device not in DEVICES:
+        return {"status": "error", "reason": f"Unknown device '{req.device}'. Choose from: {DEVICES}"}
+    if req.attack_type not in ATTACK_TYPES:
+        return {"status": "error", "reason": f"Unknown attack type '{req.attack_type}'. Choose from: {ATTACK_TYPES}"}
+
+    attack_device = f"{base_device}_attack"
+    season_id = random.randint(1, 4)
+    row = _pool.sample(season_id, attack_device, "attack", attack_type=req.attack_type)
+
+    topic = f"factory/{attack_device}/telemetry"
+    payload_json = json.dumps(row, default=str)
+    result = _mqtt_client.publish(topic, payload_json, qos=1)
+
+    if result.rc != mqtt.MQTT_ERR_SUCCESS:
+        logger.warning("Attack publish failed for %s (rc=%d)", attack_device, result.rc)
+        return {"status": "error", "reason": f"MQTT publish failed (rc={result.rc})"}
+
+    logger.info("🚨 Manual attack triggered: device=%s attack=%s → %s", attack_device, req.attack_type, topic)
+    return {
+        "status": "ok",
+        "device": attack_device,
+        "attack_type": req.attack_type,
+        "topic": topic,
+        "payload": row,
+    }
+
+
 @app.on_event("startup")
 async def start_simulation():
+    global _mqtt_client, _pool
+
     host = os.getenv("MQTT_HOST", "mosquitto")
     port = int(os.getenv("MQTT_PORT", "1883"))
     username = os.getenv("MQTT_USERNAME", "iot_client")
     password = os.getenv("MQTT_PASSWORD", "iot_password")
-    
-    # We will run continuously with default delay_min=0.3, delay_max=1.5
-    client = connect_mqtt(host, port, username, password)
-    
+
+    _mqtt_client = connect_mqtt(host, port, username, password)
+
     # Ensure CSV path exists
     if not YEARLY_CSV.exists():
         logger.error(f"Cannot find dataset at {YEARLY_CSV}! Simulation will not start.")
         return
-        
-    pool = SeasonalPool(YEARLY_CSV)
-    
-    # Normal devices
+
+    _pool = SeasonalPool(YEARLY_CSV)
+
+    # Only stream NORMAL devices continuously — attack devices are triggered on-demand via POST /attack
     for device_name in DEVICES:
         bg_tasks.append(
             asyncio.create_task(
-                stream_device(client, pool, device_name, "normal", 0.5, 2.0)
+                stream_device(_mqtt_client, _pool, device_name, "normal", 0.5, 2.0)
             )
         )
-        
-    # Attack devices
-    for device_name in DEVICES:
-        attack_type = random.choice(ATTACK_TYPES)
-        bg_tasks.append(
-            asyncio.create_task(
-                stream_device(client, pool, f"{device_name}_attack", "attack", 0.5, 2.0, attack_type=attack_type)
-            )
-        )
-    logger.info("Simulation tasks successfully launched.")
+
+    logger.info("✅ Normal device simulation started. Attack simulation is MANUAL via POST /attack.")
